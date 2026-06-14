@@ -21,6 +21,7 @@ from comfy.text_encoders.llama import apply_rope, precompute_freqs_cis
 SEQUENCE_PADDING_INDICATOR = -1
 OUTPUT_IMAGE_INDICATOR = 2
 LLM_TOKEN_INDICATOR = 3
+REFERENCE_IMAGE_INDICATOR = 4
 # Image grid coordinates are offset so they never collide with text positions
 IMAGE_POSITION_OFFSET = 65536
 
@@ -106,11 +107,11 @@ class Ideogram4EmbedScalar(nn.Module):
         self.mlp_in = operations.Linear(dim, dim, bias=True, dtype=dtype, device=device)
         self.mlp_out = operations.Linear(dim, dim, bias=True, dtype=dtype, device=device)
 
-    def forward(self, x, dtype):
+    def forward(self, x):
         x = x.to(torch.float32)
         scaled = 1e4 * (x - self.range_min) / (self.range_max - self.range_min)
         emb = _sinusoidal_embedding(scaled, self.dim)
-        emb = emb.to(dtype)
+        emb = emb.to(self.mlp_in.weight.dtype)
         emb = F.silu(self.mlp_in(emb))
         return self.mlp_out(emb)
 
@@ -157,11 +158,13 @@ class Ideogram4Transformer(nn.Module):
     def _backbone(self, llm_features, x, t, position_ids, attn_mask, indicator, transformer_options={}):
         indicator = indicator.to(torch.long)
         output_image_mask = (indicator == OUTPUT_IMAGE_INDICATOR).to(x.dtype).unsqueeze(-1)
+        reference_image_mask = (indicator == REFERENCE_IMAGE_INDICATOR).to(x.dtype).unsqueeze(-1)
+        image_mask = output_image_mask + reference_image_mask
 
-        x = x * output_image_mask
-        h = self.input_proj(x) * output_image_mask
+        x = x * image_mask
+        h = self.input_proj(x) * image_mask
 
-        t_cond = self.t_embedding(t, dtype=x.dtype)
+        t_cond = self.t_embedding(t)
         if t.dim() == 1:
             t_cond = t_cond.unsqueeze(1)
         adaln_input = F.silu(self.adaln_proj(t_cond))
@@ -174,7 +177,7 @@ class Ideogram4Transformer(nn.Module):
             llm = self.llm_cond_proj(llm) * text_mask
             h[:, :L_text] = h[:, :L_text] + llm
 
-        h = h + self.embed_image_indicator((indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long), out_dtype=h.dtype)
+        h = h + self.embed_image_indicator(image_mask.squeeze(-1).to(torch.long), out_dtype=h.dtype)
 
         # Qwen3-VL interleaved MRoPE; position_ids (B, L, 3) -> (3, L) (same across batch).
         freqs_cis = precompute_freqs_cis(
@@ -232,25 +235,45 @@ class Ideogram4Transformer2DModel(Ideogram4Transformer):
         t_idx = torch.zeros_like(h_idx)
         return torch.stack([t_idx, h_idx, w_idx], dim=1) + IMAGE_POSITION_OFFSET  # (L_img, 3)
 
-    def _run_conditional(self, x_chunk, context_chunk, attn_mask_chunk, t_chunk, gh, gw, transformer_options):
+    def _run_conditional(self, x_chunk, context_chunk, attn_mask_chunk, t_chunk, gh, gw, transformer_options, reference_latent=None):
         B = x_chunk.shape[0]
         device = x_chunk.device
         img_tokens = self._img_to_tokens(x_chunk)
         L_img = img_tokens.shape[1]
         L_text = context_chunk.shape[1]
-        L = L_text + L_img
+        reference_tokens = None
+        if reference_latent is not None:
+            if reference_latent.shape != x_chunk.shape:
+                raise ValueError(
+                    "Ideogram 4 reference latent must match the output latent shape, got "
+                    f"{tuple(reference_latent.shape)} and {tuple(x_chunk.shape)}"
+                )
+            reference_tokens = self._img_to_tokens(reference_latent)
+        L_reference = 0 if reference_tokens is None else reference_tokens.shape[1]
+        L = L_text + L_img + L_reference
         latent_dim = img_tokens.shape[-1]
 
         x_full = torch.zeros(B, L, latent_dim, dtype=img_tokens.dtype, device=device)
-        x_full[:, L_text:] = img_tokens
+        output_start = L_text
+        output_end = output_start + L_img
+        x_full[:, output_start:output_end] = img_tokens
+        if reference_tokens is not None:
+            x_full[:, output_end:] = reference_tokens
 
         text_pos = torch.arange(L_text, device=device).view(-1, 1).expand(L_text, 3)
         img_pos = self._image_position_ids(gh, gw, device)
-        position_ids = torch.cat([text_pos, img_pos], dim=0).unsqueeze(0).expand(B, L, 3)
+        position_parts = [text_pos, img_pos]
+        if reference_tokens is not None:
+            reference_pos = img_pos.clone()
+            reference_pos[:, 0] += 1
+            position_parts.append(reference_pos)
+        position_ids = torch.cat(position_parts, dim=0).unsqueeze(0).expand(B, L, 3)
 
         indicator = torch.empty(B, L, dtype=torch.long, device=device)
         indicator[:, :L_text] = LLM_TOKEN_INDICATOR
-        indicator[:, L_text:] = OUTPUT_IMAGE_INDICATOR
+        indicator[:, output_start:output_end] = OUTPUT_IMAGE_INDICATOR
+        if reference_tokens is not None:
+            indicator[:, output_end:] = REFERENCE_IMAGE_INDICATOR
 
         attn_mask = None
         if attn_mask_chunk is not None:
@@ -261,9 +284,14 @@ class Ideogram4Transformer2DModel(Ideogram4Transformer):
             # Block-diagonal mask from segment ids: (B, 1, L, L), True = attend.
             attn_mask = (segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)).unsqueeze(1)
 
-        out = self._backbone(context_chunk, x_full, t_chunk, position_ids, attn_mask, indicator,
+        model_t = t_chunk
+        if reference_tokens is not None:
+            model_t = t_chunk.unsqueeze(1).expand(-1, L).clone()
+            model_t[:, output_end:] = 1.0
+
+        out = self._backbone(context_chunk, x_full, model_t, position_ids, attn_mask, indicator,
                              transformer_options=transformer_options)
-        return self._tokens_to_img(out[:, L_text:], gh, gw)
+        return self._tokens_to_img(out[:, output_start:output_end], gh, gw)
 
     def _run_image_only(self, x_chunk, t_chunk, gh, gw, transformer_options):
         B = x_chunk.shape[0]
@@ -285,13 +313,30 @@ class Ideogram4Transformer2DModel(Ideogram4Transformer):
             comfy.patcher_extension.get_all_wrappers(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, transformer_options),
         ).execute(x, timesteps, context, attention_mask, transformer_options, **kwargs)
 
-    def _forward(self, x, timesteps, context=None, attention_mask=None, transformer_options={}, **kwargs):
+    def _forward(self, x, timesteps, context=None, attention_mask=None, transformer_options={}, reference_latents=None, **kwargs):
         bs, c, gh, gw = x.shape
 
         timesteps = 1.0 - timesteps
 
         # unconditional pass
         if context is None:
+            if reference_latents is not None:
+                raise ValueError("Ideogram 4 reference conditioning is only supported on the conditional pass")
             return -self._run_image_only(x, timesteps, gh, gw, transformer_options)
 
-        return -self._run_conditional(x, context, attention_mask, timesteps, gh, gw, transformer_options)
+        reference_latent = None
+        if reference_latents is not None:
+            if not isinstance(reference_latents, (list, tuple)) or len(reference_latents) != 1:
+                raise ValueError("Ideogram 4 reference conditioning requires exactly one reference latent")
+            reference_latent = reference_latents[0]
+
+        return -self._run_conditional(
+            x,
+            context,
+            attention_mask,
+            timesteps,
+            gh,
+            gw,
+            transformer_options,
+            reference_latent=reference_latent,
+        )
